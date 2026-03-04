@@ -7,13 +7,17 @@ import com.example.KrushiMitra.entity.User;
 import com.example.KrushiMitra.repository.SchemeRecommendationRepository;
 import com.example.KrushiMitra.repository.SchemeRepository;
 import com.example.KrushiMitra.repository.UserRepository;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
+import org.springframework.web.reactive.function.client.WebClient;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.stream.Collectors;
+import java.util.Map;
 
 @Service
 @RequiredArgsConstructor
@@ -22,25 +26,37 @@ public class SchemeService {
     private final SchemeRepository schemeRepository;
     private final SchemeRecommendationRepository recommendationRepository;
     private final UserRepository userRepository;
+    private final WebClient webClient;
+    private final ObjectMapper objectMapper;
 
-    public SchemeRecommendationResponse.ListResponse getRecommendations() {
+    @Value("${ai.api.url}") private String aiApiUrl;
+    @Value("${ai.api.key}") private String aiApiKey;
+
+    public SchemeRecommendationResponse.ListResponse getRecommendations()
+            throws Exception {
+
+        // Get logged in farmer
         String email = SecurityContextHolder.getContext()
                 .getAuthentication().getName();
         User user = userRepository.findByEmail(email)
                 .orElseThrow(() -> new RuntimeException("User not found"));
 
-        // Filter eligible schemes
-        List<Scheme> eligible = schemeRepository.findByIsActiveTrue()
-                .stream()
-                .filter(s -> isEligible(s, user))
-                .collect(Collectors.toList());
+        // Get all active schemes from DB
+        List<Scheme> allSchemes = schemeRepository.findByIsActiveTrue();
 
+        // ✅ Step 1 — Ask Gemini AI which schemes farmer is eligible for
+        List<Long> eligibleIds = getAiEligibleSchemeIds(user, allSchemes);
+
+        // ✅ Step 2 — For each eligible scheme get AI reasoning
         List<SchemeRecommendationResponse> results = new ArrayList<>();
 
-        for (Scheme scheme : eligible) {
-            // ✅ Mock AI reasoning — replace with real API call later
-            String reasoning = buildMockReasoning(scheme, user);
+        for (Scheme scheme : allSchemes) {
+            if (!eligibleIds.contains(scheme.getId())) continue;
 
+            // Get detailed AI reasoning for this scheme
+            String reasoning = getAiReasoning(user, scheme);
+
+            // Save recommendation to DB
             SchemeRecommendation rec = new SchemeRecommendation();
             rec.setUser(user);
             rec.setScheme(scheme);
@@ -64,36 +80,164 @@ public class SchemeService {
         return response;
     }
 
-    private boolean isEligible(Scheme scheme, User user) {
-        if (scheme.getMaxLandSizeAcres() != null
-                && user.getLandSizeAcres() != null
-                && user.getLandSizeAcres() > scheme.getMaxLandSizeAcres())
-            return false;
+    // ✅ Step 1 — AI decides which schemes farmer qualifies for
+    private List<Long> getAiEligibleSchemeIds(User user,
+                                               List<Scheme> schemes)
+            throws Exception {
 
-        if (scheme.getMaxAnnualIncome() != null
-                && user.getAnnualIncome() != null
-                && user.getAnnualIncome() > scheme.getMaxAnnualIncome())
-            return false;
+        // Build scheme list for AI
+        StringBuilder schemeList = new StringBuilder();
+        for (Scheme s : schemes) {
+            schemeList.append(String.format(
+                """
+                ID: %d
+                Name: %s
+                Eligible States: %s
+                Max Land Size: %s acres
+                Max Annual Income: Rs.%s
+                Eligible Categories: %s
+                ---
+                """,
+                s.getId(),
+                s.getName(),
+                s.getEligibleStates(),
+                s.getMaxLandSizeAcres() != null ? s.getMaxLandSizeAcres() : "No limit",
+                s.getMaxAnnualIncome() != null ? s.getMaxAnnualIncome() : "No limit",
+                s.getEligibleCategories() != null ? s.getEligibleCategories() : "All"
+            ));
+        }
 
-        if (scheme.getEligibleStates() != null
-                && !scheme.getEligibleStates().equalsIgnoreCase("ALL")
-                && !scheme.getEligibleStates().contains(user.getState()))
-            return false;
+        String prompt = """
+            You are an Indian government scheme eligibility expert.
+            
+            Farmer Profile:
+            - Name: %s
+            - State: %s
+            - District: %s
+            - Land Size: %.1f acres
+            - Primary Crop: %s
+            - Category: %s
+            - Annual Income: Rs.%.0f
+            
+            Available Government Schemes:
+            %s
+            
+            Based on the farmer profile above, return ONLY the IDs of schemes
+            this farmer is eligible for.
+            
+            Rules:
+            - If eligible_states is ALL, any state qualifies
+            - Farmer's land must be <= max_land_size_acres
+            - Farmer's income must be <= max_annual_income
+            - Farmer's category must be in eligible_categories
+            
+            Reply ONLY with comma separated IDs like: 1,2,3
+            No explanation, no other text, just the IDs.
+            If none eligible reply: NONE
+            """.formatted(
+                user.getFullName(),
+                user.getState(),
+                user.getDistrict(),
+                user.getLandSizeAcres(),
+                user.getPrimaryCrop(),
+                user.getCategory(),
+                user.getAnnualIncome() != null ? user.getAnnualIncome() : 0,
+                schemeList.toString()
+        );
 
-        if (scheme.getEligibleCategories() != null
-                && user.getCategory() != null
-                && !scheme.getEligibleCategories().contains(user.getCategory()))
-            return false;
+        String aiResponse = callGemini(prompt);
+        System.out.println("AI Eligible Scheme IDs: " + aiResponse);
 
-        return true;
+        List<Long> ids = new ArrayList<>();
+        if (aiResponse == null || aiResponse.trim().equals("NONE")) return ids;
+
+        // Parse comma separated IDs
+        for (String part : aiResponse.trim().split(",")) {
+            try {
+                ids.add(Long.parseLong(part.trim()));
+            } catch (NumberFormatException ignored) {}
+        }
+        return ids;
     }
 
-    private String buildMockReasoning(Scheme scheme, User user) {
-        return "You are eligible for " + scheme.getName()
-                + " because your land size is " + user.getLandSizeAcres()
-                + " acres (limit: " + scheme.getMaxLandSizeAcres() + " acres)"
-                + " and your annual income of Rs." + user.getAnnualIncome()
-                + " is within the eligible range.";
+    // ✅ Step 2 — AI explains WHY farmer is eligible for each scheme
+    private String getAiReasoning(User user, Scheme scheme) throws Exception {
+        String lang = "mr".equals(user.getPreferredLanguage())
+                ? "Respond in Marathi language."
+                : "Respond in English.";
+
+        String prompt = """
+            You are a helpful agricultural advisor in India.
+
+            Farmer: %s, %s district, %s state
+            Land: %.1f acres | Crop: %s | Category: %s | Income: Rs.%.0f/year
+
+            Scheme: %s
+            Benefits: %s
+            Apply at: %s
+
+            In exactly 2 sentences:
+            1. Why this farmer is eligible
+            2. How to apply and what benefit they get
+
+            %s
+            Keep it short, complete and encouraging.
+            Do NOT cut off mid sentence.
+            """.formatted(
+                user.getFullName(),
+                user.getDistrict(),
+                user.getState(),
+                user.getLandSizeAcres(),
+                user.getPrimaryCrop(),
+                user.getCategory(),
+                user.getAnnualIncome() != null ? user.getAnnualIncome() : 0,
+                scheme.getName(),
+                scheme.getBenefits(),
+                scheme.getApplicationUrl(),
+                lang
+        );
+
+        return callGemini(prompt);
+    }
+
+    // ✅ Reusable Gemini API caller
+    private String callGemini(String prompt) throws Exception {
+        Map<String, Object> requestBody = Map.of(
+                "contents", List.of(
+                        Map.of("parts", List.of(
+                                Map.of("text", prompt)
+                        ))
+                ),
+                "generationConfig", Map.of(
+                        "temperature", 0.3,      // ✅ low temp = more accurate
+                        "maxOutputTokens", 1024
+                )
+        );
+
+        String url = aiApiUrl + "?key=" + aiApiKey;
+
+        try {
+            String responseBody = webClient.post()
+                    .uri(url)
+                    .header("Content-Type", "application/json")
+                    .bodyValue(requestBody)
+                    .retrieve()
+                    .bodyToMono(String.class)
+                    .block();
+
+            JsonNode root = objectMapper.readTree(responseBody);
+            return root.path("candidates").get(0)
+                       .path("content")
+                       .path("parts").get(0)
+                       .path("text").asText();
+
+        } catch (Exception e) {
+            if (e.getMessage() != null && e.getMessage().contains("429")) {
+                throw new RuntimeException(
+                    "AI service is busy. Please wait 1 minute and try again.");
+            }
+            throw e;
+        }
     }
 
     public List<Scheme> getAllSchemes() {
